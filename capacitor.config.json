@@ -1,0 +1,11 @@
+{
+  "appId": "com.tracker.app",
+  "appName": "TRACKER",
+  "webDir": "www",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": false
+  }
+}
