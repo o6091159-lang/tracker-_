@@ -1,0 +1,142 @@
+name: Build TRACKER APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_NAME: TRACKER
+  APP_ID: com.tracker.app
+  APK_FILE: TRACKER.apk
+  ARTIFACT_NAME: TRACKER-android-apk
+  ANDROID_PLATFORM: android-34
+  ANDROID_BUILD_TOOLS: 34.0.0
+  GRADLE_VERSION: 8.2.1
+
+jobs:
+  build:
+    name: Build debug APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check project files
+        run: |
+          fail() { echo "::error title=ملف ناقص::$1"; exit 1; }
+          [ -f package.json ]            || fail "package.json غير موجود في جذر المستودع."
+          [ -f capacitor.config.json ]   || fail "capacitor.config.json غير موجود."
+          [ -f www/index.html ]          || fail "www/index.html غير موجود."
+          [ -f android/build.gradle ]    || fail "مجلد android غير مكتمل."
+          [ -f android/app/src/main/AndroidManifest.xml ] || fail "AndroidManifest.xml غير موجود."
+          [ -d android/app/src/main/res/mipmap-xxxhdpi ]  || fail "ملفات الأيقونة غير موجودة."
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK (accept licenses)
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools platforms;${{ env.ANDROID_PLATFORM }} build-tools;${{ env.ANDROID_BUILD_TOOLS }}
+          accept-android-sdk-licenses: true
+
+      - name: Set up Gradle ${{ env.GRADLE_VERSION }}
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Show tool versions
+        run: |
+          node -v
+          npm -v
+          java -version
+          gradle --version
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools"
+
+      - name: Install npm dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Sync web files into Android project (Capacitor)
+        run: npx cap sync android
+
+      - name: Restore debug signing key (cache)
+        id: keycache
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: tracker-debug-keystore-v1
+
+      - name: Create debug signing key if missing
+        run: |
+          mkdir -p ~/.android
+          if [ ! -f ~/.android/debug.keystore ]; then
+            echo "Creating a new debug key."
+            keytool -genkeypair -v \
+              -keystore ~/.android/debug.keystore \
+              -storepass android -keypass android \
+              -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          else
+            echo "Restored saved debug key."
+          fi
+
+      - name: Build debug APK
+        working-directory: android
+        run: gradle assembleDebug --stacktrace
+
+      - name: Prepare TRACKER.apk
+        run: |
+          SRC=android/app/build/outputs/apk/debug/app-debug.apk
+          if [ ! -f "$SRC" ]; then
+            echo "::error title=APK not produced::$SRC not found after Gradle."
+            ls -R android/app/build/outputs || true
+            exit 1
+          fi
+          mkdir -p dist
+          cp "$SRC" "dist/$APK_FILE"
+          ls -l dist
+
+      - name: Verify APK (signature, package id, app name)
+        run: |
+          BT="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS"
+          "$BT/apksigner" verify --verbose "dist/$APK_FILE" || { echo "::error title=Invalid signature::apksigner verify failed"; exit 1; }
+          BADGING="$("$BT/aapt" dump badging "dist/$APK_FILE")"
+          echo "$BADGING" | grep -E "^package:|^application-label:|^launchable-activity" || true
+          echo "$BADGING" | grep -q "package: name='$APP_ID'" \
+            || { echo "::error title=Wrong package id::expected $APP_ID"; exit 1; }
+          echo "$BADGING" | grep -q "application-label:'$APP_NAME'" \
+            || { echo "::error title=Wrong app name::expected $APP_NAME"; exit 1; }
+          echo "Verified: $APP_NAME / $APP_ID"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist/${{ env.APK_FILE }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Build failed - help message
+        if: failure()
+        run: |
+          echo "::error title=TRACKER build failed::Open the red step above to read the cause."
